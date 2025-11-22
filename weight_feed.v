@@ -7,10 +7,10 @@ module weight_feed(
     input  wire [31:0] dinB,
     input  wire [31:0] dinC,
     input  wire [31:0] dinD, 
-	output reg  [7:0] doutA,
-    output reg  [7:0] doutB,
-    output reg  [7:0] doutC,
-    output reg  [7:0] doutD
+	output wire [7:0] doutA,
+    output wire [7:0] doutB,
+    output wire [7:0] doutC,
+    output wire [7:0] doutD
 );
 
 // weight registers (4 x 4 bytes)
@@ -19,6 +19,11 @@ reg [31:0] dataB;
 reg [31:0] dataC;
 reg [31:0] dataD;
 
+// output registers
+reg [7:0] doutA_reg;
+reg [7:0] doutB_reg;
+reg [7:0] doutC_reg;
+reg [7:0] doutD_reg;
 
 // MSB first version------------------------------
 // data storage logic
@@ -44,17 +49,22 @@ end
 // data out logic 
 always @(posedge clk or negedge rstn) begin
     if (!rstn) begin
-        doutA <= 8'b0;
-        doutB <= 8'b0;
-        doutC <= 8'b0;
-        doutD <= 8'b0;
+        doutA_reg <= 8'b0;
+        doutB_reg <= 8'b0;
+        doutC_reg <= 8'b0;
+        doutD_reg <= 8'b0;
     end else if (en_out) begin
-		doutA <= dataA[31:24];
-        doutB <= dataB[31:24];
-        doutC <= dataC[31:24];
-        doutD <= dataD[31:24];
+		doutA_reg <= dataA[31:24];
+        doutB_reg <= dataB[31:24];
+        doutC_reg <= dataC[31:24];
+        doutD_reg <= dataD[31:24];
     end
 end
+
+assign doutA = doutA_reg;
+assign doutB = doutB_reg;
+assign doutC = doutC_reg;
+assign doutD = doutD_reg;
 //-----------------------------------------------   
 
 /* LSB first version-----------------------------
@@ -81,17 +91,22 @@ end
 // data out logic 
 always @(posedge clk or negedge rstn) begin
     if (!rstn) begin
-        doutA <= 8'b0;
-        doutB <= 8'b0;
-        doutC <= 8'b0;
-        doutD <= 8'b0;
+        doutA_reg <= 8'b0;
+        doutB_reg <= 8'b0;
+        doutC_reg <= 8'b0;
+        doutD_reg <= 8'b0;
     end else if (en_out) begin
-		doutA <= dataA[7:0];
-        doutB <= dataB[7:0];
-        doutC <= dataC[7:0];
-        doutD <= dataD[7:0];
+		doutA_reg <= dataA[7:0];
+        doutB_reg <= dataB[7:0];
+        doutC_reg <= dataC[7:0];
+        doutD_reg <= dataD[7:0];
     end
 end
+
+assign doutA = doutA_reg;
+assign doutB = doutB_reg;
+assign doutC = doutC_reg;
+assign doutD = doutD_reg;
 //-----------------------------------------------
 */
 endmodule
