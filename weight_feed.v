@@ -50,11 +50,12 @@ always @(posedge clk or negedge rstn) begin
         doutC <= 8'b0;
         doutD <= 8'b0;
     end else if (en_out) begin
-        doutA <= dataA[7:0];
-        doutB <= dataB[7:0];
-        doutC <= dataC[7:0];
-        doutD <= dataD[7:0];
+		doutA <= dataA[31:24];
+        doutB <= dataB[31:24];
+        doutC <= dataC[31:24];
+        doutD <= dataD[31:24];
     end
 end
+
 
 endmodule
