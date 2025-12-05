@@ -1,0 +1,370 @@
+`timescale 1ns / 1ps
+
+module WIN_GEN #(
+    parameter WIN_R = 6,
+    parameter WIN_C = 8
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        start,
+    
+    // BRAM Interface
+    output reg  [7:0]  bram_addr,
+    output reg         bram_en,
+    input  wire [31:0] bram_dout,
+
+    // PE Interface
+    output reg  [7:0]  PE_data_col0,
+    output reg  [7:0]  PE_data_col1,
+    output reg  [7:0]  PE_data_col2,
+    output reg  [7:0]  PE_data_col3,
+    output reg         PE_data_valid,
+    
+    // Status
+    output reg         is_zero_latched,
+    output reg         busy,
+    output reg         done
+);
+
+    // =================================================================
+    // 1. Parameters
+    // =================================================================
+    localparam WIN_SIZE      = WIN_R * WIN_C; 
+    localparam SUB_WIN_WIDTH = 6 * 6 * 8; 
+    localparam COUNTER_MAX   = 3'd4; 
+    localparam IMG_WIDTH     = 28;
+    
+    // Z-Scan: (28 - 6)/2 = 11 steps -> Index 0 to 10 (Last 12th is internal)
+    localparam COL_MAX = 4'd10; 
+    localparam ROW_MAX = 4'd11;
+
+    localparam DIR_RIGHT = 2'd0;
+    localparam DIR_LEFT  = 2'd1;
+    localparam DIR_DOWN  = 2'd2;
+    localparam DIR_NONE  = 2'd3;
+
+    // =================================================================
+    // 2. Internal Registers & Signals
+    // =================================================================
+    reg [7:0] win [0:WIN_SIZE-1];
+
+    reg [3:0] move_cnt_row; 
+    reg [3:0] move_cnt_col; 
+    reg [2:0] stm_cnt_row; 
+    reg [2:0] stm_cnt_col; 
+    reg [3:0] refill_cnt; 
+
+    reg       move_done;
+    reg       trigger_move;
+    
+    reg [1:0] next_move_dir; 
+    reg [3:0] refill_max;    
+    reg [2:0] cap_step;
+    
+    reg stm_phase; // 0: Left, 1: Right
+    wire native_phase;
+    wire stm_mode;
+    wire is_edge;
+
+    // 💡 Zero Check Logic
+    wire [SUB_WIN_WIDTH - 1:0] win_sub_vec;
+    wire [2:0] stream_start_col;
+    wire all_zero_comb; // 실시간 조합 논리
+
+    reg [3:0] idx_req;
+    reg [3:0] idx_cap;
+    wire [2:0] boot_row_idx;
+    wire       boot_word_sel;
+
+    integer i, j;
+
+    // =================================================================
+    // 3. Logic & Helpers
+    // =================================================================
+    function integer IDX;
+        input integer r, c;
+        begin IDX = r * WIN_C + c; end
+    endfunction
+
+    function [7:0] get_addr;
+        input integer r, c;
+        reg [9:0] px_idx;
+        begin
+            px_idx = r * IMG_WIDTH + c;
+            get_addr = px_idx[9:2]; 
+        end
+    endfunction
+
+    function [7:0] boot_addr_of_case;
+        input [3:0] idx;
+        begin
+            case (idx)
+                4'd0:  boot_addr_of_case = 8'd0;  4'd1:  boot_addr_of_case = 8'd1;
+                4'd2:  boot_addr_of_case = 8'd7;  4'd3:  boot_addr_of_case = 8'd8;
+                4'd4:  boot_addr_of_case = 8'd14; 4'd5:  boot_addr_of_case = 8'd15;
+                4'd6:  boot_addr_of_case = 8'd21; 4'd7:  boot_addr_of_case = 8'd22;
+                4'd8:  boot_addr_of_case = 8'd28; 4'd9:  boot_addr_of_case = 8'd29;
+                4'd10: boot_addr_of_case = 8'd35; 4'd11: boot_addr_of_case = 8'd36;
+                default: boot_addr_of_case = 8'hFF;
+            endcase
+        end
+    endfunction
+
+    assign native_phase = move_cnt_row[0]; // 0(Even)->Left, 1(Odd)->Right
+    
+    // Edge Detection: Col 10 or Col 0
+    assign is_edge = ( (!move_cnt_row[0]) && (move_cnt_col == COL_MAX) ) || 
+                     ( (move_cnt_row[0])  && (move_cnt_col == 4'd0)    );
+
+    // Mode: 0=PhaseShift(No Move), 1=TriggerMove
+    assign stm_mode = (is_edge && (stm_phase == native_phase)) ? 1'b0 : 1'b1;
+
+    // 💡 Zero Check Vector Construction (Combinational)
+    assign stream_start_col = stm_phase ? 3'd2 : 3'd0;
+    
+    genvar r_g, c_g;
+    generate
+        for (r_g = 0; r_g < 6; r_g = r_g + 1) begin : row_gen
+            for (c_g = 0; c_g < 6; c_g = c_g + 1) begin : col_gen
+                assign win_sub_vec[(r_g*6 + c_g)*8 +: 8] = win[IDX(r_g, stream_start_col + c_g)];
+            end
+        end
+    endgenerate
+    assign all_zero_comb = (win_sub_vec == {SUB_WIN_WIDTH{1'b0}});
+
+    assign boot_row_idx  = idx_cap[3:1];
+    assign boot_word_sel = idx_cap[0];
+
+
+    // =================================================================
+    // 4. FSM
+    // =================================================================
+    localparam [2:0]
+        S_IDLE   = 3'd0, S_WAIT   = 3'd1, S_BOOT   = 3'd2,
+        S_ACTIVE = 3'd3, S_DONE   = 3'd4;
+
+    reg [2:0] state, next_state;
+
+    always @(*) begin
+        next_state = state;
+        case (state)
+            S_IDLE:   if (start) next_state = S_WAIT;
+            S_WAIT:   next_state = S_BOOT;
+            S_BOOT:   next_state = (idx_cap == 4'd11) ? S_ACTIVE : S_BOOT;
+            S_ACTIVE: begin
+                // Check using LATCHED Zero Flag
+                if (is_zero_latched || (stm_cnt_col == COUNTER_MAX && stm_cnt_row == COUNTER_MAX)) begin
+                    if (trigger_move && move_done) next_state = S_DONE;
+                    else next_state = S_ACTIVE;
+                end else next_state = S_ACTIVE;
+            end
+            S_DONE:   next_state = S_IDLE;
+            default:  next_state = S_IDLE;
+        endcase
+    end
+
+    // Trigger Logic (Uses is_zero_latched)
+    always @(*) begin
+        trigger_move = 0;
+        if (state == S_ACTIVE) begin
+            if (is_zero_latched || (stm_cnt_col == COUNTER_MAX && stm_cnt_row == COUNTER_MAX)) begin
+                trigger_move = stm_mode; // 1: Move, 0: Stay
+            end
+        end
+    end
+
+
+    // =================================================================
+    // 5. Sequential Logic
+    // =================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_IDLE;
+            busy <= 0; done <= 0; bram_en <= 0; bram_addr <= 0;
+            idx_req <= 0; idx_cap <= 0;
+            PE_data_valid <= 0; PE_data_col0 <= 0; PE_data_col1 <= 0; PE_data_col2 <= 0; PE_data_col3 <= 0;
+            stm_cnt_row <= 0; stm_cnt_col <= 0;
+            move_cnt_row <= 0; move_cnt_col <= 0; move_done <= 0;
+            stm_phase <= 0;
+            refill_cnt <= 0; refill_max <= 0; next_move_dir <= DIR_NONE;
+            is_zero_latched <= 0;
+            for (i=0; i<WIN_R; i=i+1) for (j=0; j<WIN_C; j=j+1) win[IDX(i,j)] <= 0;
+
+        end else begin
+            state <= next_state;
+            done  <= 0; PE_data_valid <= 0;
+
+            case (state)
+                S_IDLE: begin
+                    busy <= start; bram_en <= 0; idx_req <= 0; idx_cap <= 0;
+                    stm_phase <= 0; move_done <= 0; is_zero_latched <= 0;
+                    if (start) bram_en <= 1;
+                end
+
+                S_WAIT: begin bram_en <= 1; idx_req <= idx_req + 1; idx_cap <= idx_req; end
+
+                S_BOOT: begin
+                    idx_cap <= idx_req;
+                    bram_addr <= boot_addr_of_case(idx_req);
+                    if (boot_word_sel == 1'b0) begin
+                        win[IDX(boot_row_idx,0)] <= bram_dout[7:0];   win[IDX(boot_row_idx,1)] <= bram_dout[15:8];
+                        win[IDX(boot_row_idx,2)] <= bram_dout[23:16]; win[IDX(boot_row_idx,3)] <= bram_dout[31:24];
+                    end else begin
+                        win[IDX(boot_row_idx,4)] <= bram_dout[7:0];   win[IDX(boot_row_idx,5)] <= bram_dout[15:8];
+                        win[IDX(boot_row_idx,6)] <= bram_dout[23:16]; win[IDX(boot_row_idx,7)] <= bram_dout[31:24];
+                    end
+                    
+                    if (idx_req != 4'd11) idx_req <= idx_req + 1;
+                    else begin
+                        bram_en <= 0;
+                    end
+                end
+
+                S_ACTIVE: begin
+                    // 💡 [Refill 완료 Check & Latch Zero]
+                    // Refill이 끝난 시점(또는 초기 진입 시점)에 Zero 여부를 판단하여 저장
+                    // refill_cnt가 max에 도달했을 때 or Boot 직후(refill_cnt=0 & stm_cnt=0)
+                    
+                    // Case 1: Boot 직후 (첫 진입)
+                    if (stm_cnt_row == 0 && stm_cnt_col == 0 && refill_cnt == 0 && !trigger_move) begin
+                         is_zero_latched <= all_zero_comb;
+                    end
+                    
+                    // Case 2: Refill 완료 직후
+                    if (refill_cnt == refill_max && refill_max > 0) begin
+                         is_zero_latched <= all_zero_comb; 
+                    end
+                    
+                    // Case 3: Phase Shift 직후 (Refill 없이 윈도우만 바뀜)
+                    if (stm_mode == 1'b0 && all_zero_comb) begin 
+                        // Phase Shift가 일어났으면, 바뀐 윈도우에 대해 다시 체크해야 함
+                        // 다음 사이클에 반영되도록.
+                        is_zero_latched <= all_zero_comb; 
+                        // 주의: stm_phase가 바뀌는 순간 all_zero_comb도 바뀜.
+                    end
+
+
+                    // --- PART 1: Output & Control ---
+                    // 💡 LATCHED 값을 사용하여 판단
+                    if (is_zero_latched || (stm_cnt_col == COUNTER_MAX && stm_cnt_row == COUNTER_MAX)) begin
+                        PE_data_valid <= 0;
+                        stm_cnt_row <= 0; stm_cnt_col <= 0;
+                        
+                        if (stm_mode == 1'b0) begin 
+                            stm_phase <= ~stm_phase; // Phase Shift
+                            // 💡 Phase가 바뀌었으므로, 다음 사이클을 위해 Zero Flag 업데이트 예약
+                            // (조합회로는 즉시 바뀌지만 레지스터는 다음 클럭에 반영)
+                            // 여기서 바로 assign 할 수 없으므로 다음 클럭에 all_zero_comb가 latch되도록 해야 함.
+                            // 위쪽 'Case 3' 로직이 이를 처리함.
+                        end
+                    end else if (!is_zero_latched) begin
+                        PE_data_valid <= 1;
+                        if (stm_phase) begin // RIGHT
+                             PE_data_col0 <= win[IDX(stm_cnt_row, stm_cnt_col + 2)];
+                             PE_data_col1 <= win[IDX(stm_cnt_row, stm_cnt_col + 3)];
+                             PE_data_col2 <= win[IDX(stm_cnt_row + 1, stm_cnt_col + 2)];
+                             PE_data_col3 <= win[IDX(stm_cnt_row + 1, stm_cnt_col + 3)];
+                        end else begin // LEFT
+                             PE_data_col0 <= win[IDX(stm_cnt_row, stm_cnt_col)];
+                             PE_data_col1 <= win[IDX(stm_cnt_row, stm_cnt_col + 1)];
+                             PE_data_col2 <= win[IDX(stm_cnt_row + 1, stm_cnt_col)];
+                             PE_data_col3 <= win[IDX(stm_cnt_row + 1, stm_cnt_col + 1)];
+                        end
+                        
+                        if (stm_cnt_col == COUNTER_MAX) begin
+                            stm_cnt_col <= 0; stm_cnt_row <= stm_cnt_row + 1;
+                        end else stm_cnt_col <= stm_cnt_col + 1;
+                    end
+
+                    // --- PART 2: Parallel Refill ---
+                    refill_cnt <= refill_cnt + 1;
+                    if (refill_cnt < refill_max) begin
+                        bram_en <= 1;
+                        if (next_move_dir == DIR_DOWN) begin
+                            if (refill_cnt < 2) begin 
+                                if (refill_cnt[0] == 0) bram_addr <= get_addr(move_cnt_row*2 + 4, move_cnt_col*2 + 0);
+                                else                    bram_addr <= get_addr(move_cnt_row*2 + 4, move_cnt_col*2 + 4);
+                            end else begin 
+                                if (refill_cnt[0] == 0) bram_addr <= get_addr(move_cnt_row*2 + 5, move_cnt_col*2 + 0);
+                                else                    bram_addr <= get_addr(move_cnt_row*2 + 5, move_cnt_col*2 + 4);
+                            end
+                        end else if (next_move_dir == DIR_RIGHT) begin
+                            bram_addr <= get_addr(move_cnt_row*2 + refill_cnt, move_cnt_col*2 + 6);
+                        end else if (next_move_dir == DIR_LEFT) begin
+                            bram_addr <= get_addr(move_cnt_row*2 + refill_cnt, move_cnt_col*2 + 0);
+                        end
+                    end else begin
+                        bram_en <= 0;
+                    end
+
+                    if (refill_cnt > 0 && refill_cnt <= refill_max) begin
+                         cap_step = refill_cnt - 1;
+                        if (next_move_dir == DIR_DOWN) begin
+                            if (cap_step < 2) begin 
+                                if (cap_step[0] == 0) begin 
+                                    win[IDX(4,0)] <= bram_dout[7:0];   win[IDX(4,1)] <= bram_dout[15:8];
+                                    win[IDX(4,2)] <= bram_dout[23:16]; win[IDX(4,3)] <= bram_dout[31:24];
+                                end else begin 
+                                    win[IDX(4,4)] <= bram_dout[7:0];   win[IDX(4,5)] <= bram_dout[15:8];
+                                    win[IDX(4,6)] <= bram_dout[23:16]; win[IDX(4,7)] <= bram_dout[31:24];
+                                end
+                            end else begin 
+                                if (cap_step[0] == 0) begin 
+                                    win[IDX(5,0)] <= bram_dout[7:0];   win[IDX(5,1)] <= bram_dout[15:8];
+                                    win[IDX(5,2)] <= bram_dout[23:16]; win[IDX(5,3)] <= bram_dout[31:24];
+                                end else begin 
+                                    win[IDX(5,4)] <= bram_dout[7:0];   win[IDX(5,5)] <= bram_dout[15:8];
+                                    win[IDX(5,6)] <= bram_dout[23:16]; win[IDX(5,7)] <= bram_dout[31:24];
+                                end
+                            end
+                        end else if (next_move_dir == DIR_RIGHT) begin
+                            if (move_cnt_col[0] == 1'b1) begin 
+                                win[IDX(cap_step, 6)] <= bram_dout[7:0];   win[IDX(cap_step, 7)] <= bram_dout[15:8];
+                            end else begin 
+                                win[IDX(cap_step, 6)] <= bram_dout[23:16]; win[IDX(cap_step, 7)] <= bram_dout[31:24];
+                            end
+                        end else if (next_move_dir == DIR_LEFT) begin
+                            if (move_cnt_col[0] == 1'b1) begin 
+                                win[IDX(cap_step, 0)] <= bram_dout[7:0];   win[IDX(cap_step, 1)] <= bram_dout[15:8];
+                            end else begin 
+                                win[IDX(cap_step, 0)] <= bram_dout[23:16]; win[IDX(cap_step, 1)] <= bram_dout[31:24];
+                            end
+                        end
+                    end
+
+                    // --- PART 3: Move & Shift Logic ---
+                    if (trigger_move && !move_done) begin
+                        refill_cnt <= 0;
+                        if (move_cnt_row[0] == 1'b0) begin 
+                            if (move_cnt_col < COL_MAX) begin
+                                move_cnt_col <= move_cnt_col + 1;
+                                next_move_dir <= DIR_RIGHT; refill_max <= 6;
+                                for (i=0; i<WIN_R; i=i+1) for (j=0; j<WIN_C-2; j=j+1) win[IDX(i,j)] <= win[IDX(i,j+2)];
+                            end else begin
+                                if (move_cnt_row < ROW_MAX) begin
+                                    move_cnt_row <= move_cnt_row + 1;
+                                    next_move_dir <= DIR_DOWN; refill_max <= 4;
+                                    for (i=0; i<WIN_R-2; i=i+1) for (j=0; j<WIN_C; j=j+1) win[IDX(i,j)] <= win[IDX(i+2,j)];
+                                end else move_done <= 1;
+                            end
+                        end else begin 
+                            if (move_cnt_col > 0) begin
+                                move_cnt_col <= move_cnt_col - 1;
+                                next_move_dir <= DIR_LEFT; refill_max <= 6;
+                                for (i=0; i<WIN_R; i=i+1) for (j=WIN_C-1; j>1; j=j-1) win[IDX(i,j)] <= win[IDX(i,j-2)];
+                            end else begin
+                                if (move_cnt_row < ROW_MAX) begin
+                                    move_cnt_row <= move_cnt_row + 1;
+                                    next_move_dir <= DIR_DOWN; refill_max <= 4;
+                                    for (i=0; i<WIN_R-2; i=i+1) for (j=0; j<WIN_C; j=j+1) win[IDX(i,j)] <= win[IDX(i+2,j)];
+                                end else move_done <= 1;
+                            end
+                        end
+                    end
+                end
+
+                S_DONE: begin busy <= 0; done <= 1; end
+            endcase
+        end
+    end
+endmodule
